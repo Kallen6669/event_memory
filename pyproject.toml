@@ -1,0 +1,18 @@
+[project]
+name = "event-memory-local"
+version = "0.1.0"
+description = "离线转录文档的有据经历与主题记忆"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+chatgpt = ["PyJWT[crypto]==2.10.1", "cryptography==46.0.3"]
+
+[project.scripts]
+event-memory = "event_memory.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["event_memory*"]
+
+[tool.setuptools.package-data]
+event_memory = ["web/*.html", "web/*.js", "web/*.css"]

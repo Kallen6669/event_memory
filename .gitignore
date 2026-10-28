@@ -1,0 +1,22 @@
+# 本地密钥、真实转录、模型原始结果及运行数据库不进入版本库。
+.env
+.env.*
+!.env.example
+data/true_data/
+# 真实转录的GT及逐字证据仅保留本地。
+tests/gt/TRANSCRIPT/
+.runtime/
+reports/
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+# 交付结果和可转移凭据只在本机私有压缩包保存。
+delivery_data/
+private_credentials/
+releases/
+*.zip
