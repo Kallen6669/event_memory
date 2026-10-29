@@ -8,7 +8,8 @@
 <main>
 <section class="panel"><div class="row"><h2>导入与处理</h2><span id="budget" class="muted"></span></div>
 <p class="muted">转录和模型结果保存在本机。点击“生成经历”会向 OpenAI 官方接口发送转录，消耗你已授权的 ChatGPT 套餐用量；旧结果保留原模型版本。</p>
-<div class="row"><input id="file" type="file" accept=".md,.txt"><input id="recording" placeholder="录音标识，默认文件名" aria-label="录音标识"><button id="import">导入文档</button></div>
+<p class="muted">支持UTF-8 TXT（先转为MD兼容转录）及原有MD，须保留时间和说话人。</p>
+<div class="row"><input id="file" type="file" accept=".txt,.md" aria-label="选择TXT或MD转录文件"><input id="recording" placeholder="录音标识，默认文件名" aria-label="录音标识"><button id="import">导入转录</button></div>
 <div id="sources"></div><details><summary>处理状态</summary><div id="jobs"></div></details></section>
 <section class="panel"><div class="row"><h2>查找经历</h2><span id="count" class="muted"></span></div>
 <div class="row"><input id="query" placeholder="搜索经历中的内容" aria-label="搜索内容"><select id="topic" aria-label="按主题筛选"><option value="">全部主题</option></select><button id="search">查询</button></div>

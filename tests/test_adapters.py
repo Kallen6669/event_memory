@@ -149,5 +149,17 @@ class HTTPConsumerTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(request)
         self.assertEqual(error.exception.code,400)
 
+    def test_txt_upload_preserves_verbatim_evidence_and_does_not_generate(self):
+        imported=self.request("/api/sources",{"text":SAMPLE,"filename":"会议.TXT","recording":"上传TXT"})
+        self.assertEqual(json.loads(imported["metadata"])["input_format"],"txt")
+        store=Store(self.path)
+        try:
+            self.assertEqual(store.source("local",imported["id"])["raw"],SAMPLE)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM jobs WHERE source_id=?",(imported["id"],)).fetchone()[0],0)
+        finally:store.close()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("/api/sources",{"text":"无时间标签正文","filename":"bad.txt","recording":"拒绝TXT"})
+        self.assertEqual(error.exception.code,400)
+
 
 if __name__ == "__main__": unittest.main()

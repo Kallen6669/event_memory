@@ -15,6 +15,7 @@ from .openai_model import ChatGPTModel
 from .pipeline import Pipeline
 from .prompt import PROMPT_VERSION
 from .store import Store, dumps, fingerprint
+from .input_adapter import prepare_input
 
 ASSETS = Path(__file__).resolve().parent / "web"
 
@@ -160,7 +161,8 @@ def create_server(db_path: Path, owner: str = "local", port: int = 8765,
                 if parts == ["api", "sources"]:
                     if not isinstance(value.get("text"), str) or not isinstance(value.get("recording"), str):
                         raise MemoryError("invalid_request", "需要转录文本和录音标识。")
-                    source = store.import_source(owner, value["text"], value["recording"])
+                    document = prepare_input(value["text"], value.get("filename", "transcript.md"))
+                    source = store.import_source(owner, document.markdown, value["recording"], metadata=document.metadata)
                     self.send_body({k: v for k, v in source.items() if k != "raw"}, 201)
                 elif parts == ["api", "process"]:
                     config = ChatGPTConfig.load()

@@ -12,6 +12,7 @@ from .openai_model import create_model
 from .pipeline import Pipeline
 from .store import Store
 from .transcript import build_batches, parse_transcript
+from .input_adapter import load_input, convert_txt_file
 
 DEFAULT_DB = ROOT / ".runtime" / "memory.sqlite"
 DEFAULT_LEDGER = default_ledger_path()
@@ -59,11 +60,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--ledger", default=str(DEFAULT_LEDGER), help="与事实库配套的调用账本；独立测试库请同时指定")
     p.add_argument("--owner", default="local", help="可信本地账号命名空间，不等同于远程身份认证")
     commands = p.add_subparsers(dest="command", required=True, title="操作")
+    child = commands.add_parser("txt-to-md", help="把TXT转录转为MD文件，不调用模型或写入数据库")
+    child.add_argument("file", help="UTF-8 TXT转录文件")
+    child.add_argument("--out", help="输出MD路径，默认同目录同名.md；不覆盖已有文件")
     for name, help_text in (("inspect", "只解析文档并查看批次，不调用模型"),
                             ("import", "导入本地候选文档，不调用模型"),
                             ("process", "导入并调用官方模型处理文档")):
         child = commands.add_parser(name, help=help_text)
-        child.add_argument("file", help="UTF-8 转录文档路径")
+        child.add_argument("file", help="UTF-8 TXT转录文件，兼容现有MD")
         child.add_argument("--recording-id", help="逻辑录音标识，默认文件名；不同录音请使用不同标识")
         child.add_argument("--revision", help="来源修订，默认原文内容摘要")
         child.add_argument("--batch-chars", type=int, default=6000, help="单批阅读容量，非事件边界")
@@ -132,13 +136,19 @@ def main(argv=None) -> int:
     store = None
     ledger = None
     try:
+        if args.command == "txt-to-md":
+            target = convert_txt_file(args.file, args.out)
+            emit({"status":"converted", "output":str(target.resolve()), "model_calls":0})
+            return 0
         if args.command == "inspect":
-            transcript = parse_transcript(read_text(args.file))
+            document = load_input(args.file)
+            transcript = parse_transcript(document.markdown)
             batches = build_batches(transcript.segments, args.batch_chars, args.context_chars)
             emit({"source_hash": transcript.content_hash, "candidate": transcript.candidate,
                   "segments": len(transcript.segments), "speech_segments": sum(s.kind == "speech" for s in transcript.segments),
                   "acoustic_segments": sum(s.kind == "acoustic" for s in transcript.segments),
-                  "batches": len(batches), "model_calls": 0, "mode": "local_experiment"})
+                  "batches": len(batches), "input_format":document.input_format,
+                  "batches_input_format":"md", "model_calls": 0, "mode": "local_experiment"})
             return 0
         if args.command == "chatgpt-login":
             from .chatgpt_auth import login, ProbeError
@@ -199,7 +209,9 @@ def main(argv=None) -> int:
             ledger = Ledger(args.ledger, configured_budget())
             ledger.bind_store(store)
         if args.command in {"import", "process"}:
-            source = store.import_source(args.owner, read_text(args.file), args.recording_id or Path(args.file).name, args.revision)
+            document = load_input(args.file)
+            source = store.import_source(args.owner, document.markdown, args.recording_id or Path(args.file).name, args.revision,
+                                         metadata=document.metadata)
             if args.command == "import":
                 emit({k: v for k, v in source.items() if k != "raw"})
             else:

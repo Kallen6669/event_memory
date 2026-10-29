@@ -214,12 +214,15 @@ if(["queued","running","unknown","failed"].includes(j.status))row.append(action(
 $("import").addEventListener("click",async()=>{
   try{
     const f=$("file").files[0];
-    if(!f)throw new Error("请先选择 UTF-8 转录文档。");
+    if(!f)throw new Error("请先选择UTF-8 TXT转录文件，也可使用原有MD。");
+    let text;
+    try{text=new TextDecoder("utf-8",{fatal:true}).decode(await f.arrayBuffer());}
+    catch(_){throw new Error("文件必须为UTF-8编码，请先转换编码。");}
     const result=await api("/api/sources",{
-      recording:$("recording").value.trim()||f.name,text:await f.text()
+      recording:$("recording").value.trim()||f.name,filename:f.name,text
     }
     );
-    message("文档已导入；点击生成经历后才会调用模型。");
+    message(/\.txt$/i.test(f.name)?"TXT已转换为MD兼容转录格式并导入，原话未改写；点击生成经历后才调用模型。":"MD已导入；点击生成经历后才调用模型。");
     await refreshStatus();
   }
   catch(e){

@@ -17,6 +17,7 @@ from event_memory.openai_model import ChatGPTModel
 from event_memory.pipeline import Pipeline
 from event_memory.server import create_server
 from event_memory.store import Store
+from event_memory.input_adapter import load_input
 
 OWNER = "gt-evaluation"
 
@@ -114,7 +115,8 @@ def view(args):
 def run(args):
     if args.check:
         raise MemoryError("invalid_mode", "--check仅用于查看模式；不会以检查名义运行真实模型。")
-    source = Path(args.input).resolve() if args.input else ROOT / "delivery_data/input/TRANSCRIPT.md"
+    default_input = ROOT / "delivery_data/input/TRANSCRIPT.txt"
+    source = Path(args.input).resolve() if args.input else default_input if default_input.exists() else ROOT / "delivery_data/input/TRANSCRIPT.md"
     if not source.is_file():
         raise MemoryError("input_missing", "缺少ASR文件；请附上delivery_data，或用--input指定UTF-8转录文件。")
     import_credentials()
@@ -145,9 +147,13 @@ def run(args):
             result = pipeline.resume(OWNER, saved["job_id"])
         else:
             frozen = work / "input.md"
+            metadata_file = work / "input-metadata.json"
             if not frozen.exists():
-                frozen.write_bytes(source.read_bytes())
-            imported = store.import_source(OWNER, frozen.read_text(encoding="utf-8-sig"), "TRANSCRIPT-handoff")
+                document = load_input(source)
+                frozen.write_bytes(document.markdown.encode("utf-8"))
+                save(metadata_file, document.metadata)
+            metadata = json.loads(metadata_file.read_text(encoding="utf-8")) if metadata_file.exists() else None
+            imported = store.import_source(OWNER, frozen.read_bytes().decode("utf-8-sig"), "TRANSCRIPT-handoff", metadata=metadata)
             result = pipeline.process(OWNER, imported["id"], "handoff-full-run", 6000, 900)
         saved.update(status=result["status"], job_id=result["job_id"])
         save(work / "result.json", result)
@@ -173,7 +179,7 @@ def main():
     p = argparse.ArgumentParser(description="交付包：查看结果或从头处理ASR文档")
     p.add_argument("mode", choices=["view", "run"], help="view查看已有结果；run真实处理")
     p.add_argument("--port", type=int, default=8765, help="本机页面端口，默认8765")
-    p.add_argument("--input", help="重新处理的UTF-8转录文件，默认交付原文")
+    p.add_argument("--input", help="UTF-8 TXT转录文件，兼容MD；默认优先使用交付TXT")
     p.add_argument("--check", action="store_true", help="只检查已有演示数据，不启动网页或调用模型")
     args = p.parse_args()
     try:
