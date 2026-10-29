@@ -39,7 +39,15 @@ class DeepSeekModel:
     def __init__(self, config: ModelConfig, ledger: Ledger):
         self.config, self.ledger = config, ledger
 
-    def replay(self, call_id: str, job_id: str) -> dict | None:
+    def saved_messages(self, call_id: str, job_id: str):
+        row = self.ledger.get(call_id)
+        if not row:
+            return None
+        if row["job_id"] != job_id or not row["request_payload"]:
+            raise MemoryError("request_conflict", "历史请求上下文不可恢复。")
+        return json.loads(row["request_payload"])["messages"]
+
+    def replay(self, call_id: str, job_id: str, messages=None) -> dict | None:
         """修正本地校验器后仍复用原响应；调用方必须再次核验当前来源与引用范围。"""
         row = self.ledger.get(call_id)
         if row is None or row["state"] != "received":
@@ -48,6 +56,10 @@ class DeepSeekModel:
             raise MemoryError("request_conflict", "原响应不属于当前作业或模型。")
         if row["response"] is None:
             raise MemoryError("cleared", "原模型响应已清除，不允许重建。")
+        if messages is not None:
+            from .store import fingerprint
+            if row["request_hash"] != fingerprint({"model": self.config.model, "messages": messages}):
+                raise MemoryError("request_conflict", "历史响应对应的输入与当前请求不一致。")
         return self._decode_response(json.loads(row["response"]))
 
     def generate(self, call_id: str, job_id: str, messages: list[dict]) -> dict:

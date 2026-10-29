@@ -167,6 +167,9 @@ def validate_output(value, batch: dict, candidates: dict) -> dict:
             if not isinstance(claim_refs, list) or not claim_refs or not all(isinstance(ref, str) and ref in allowed for ref in claim_refs):
                 raise InvalidOutput("主张引用必须包含在本事件依据中。")
             claim_refs = sorted(set(claim_refs))
+            positions = [int(ref[1:]) for ref in claim_refs]
+            if positions != list(range(positions[0], positions[-1] + 1)):
+                raise InvalidOutput("单条主张须引用连续来源片段，不能跳过中间否定、条件或其他原话；请拆分主张。")
             extra_refs = [ref for ref in claim_refs if ref not in refs]
             if extra_refs:
                 refs = sorted(set(refs + extra_refs))

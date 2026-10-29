@@ -45,7 +45,10 @@ class Transcript:
 
 
 def parse_transcript(raw: str) -> Transcript:
+    if not isinstance(raw, str) or not raw.strip():
+        raise MemoryError("empty_input", "转录内容为空，未创建成功作业。")
     segments = []
+    rejected = []
     offset = 0
     for line_number, original in enumerate(raw.splitlines(keepends=True), 1):
         line = original.rstrip("\r\n")
@@ -63,7 +66,17 @@ def parse_transcript(raw: str) -> Transcript:
             ))
         elif line.lstrip().startswith("["):
             raise MemoryError("invalid_transcript", f"第 {line_number} 行无法解析，未静默丢弃。")
+        elif line.strip() and not (line.lstrip().startswith("#") or line.strip() in {"---", "***"}
+                or not segments and line.lstrip().startswith((">", "格式：", "格式:", "纯声学事件不混入"))):
+            rejected.append(line_number)
         offset += len(original)
+    if rejected:
+        code = "partial_transcript" if segments else "unsupported_transcript"
+        raise MemoryError(code, "正文格式不支持，未忽略内容；请检查行号：" + ",".join(map(str, rejected[:10])))
+    if not segments:
+        raise MemoryError("empty_input", "文档只有说明或标题，没有可处理的转录片段。")
+    if not any(s.kind == "speech" and s.text.strip() for s in segments):
+        raise MemoryError("no_speech", "文档没有可用语音正文，未创建成功作业。")
     candidate = any("候选" in line for line in raw.splitlines()[:10])
     return Transcript(raw, hashlib.sha256(raw.encode("utf-8")).hexdigest(), tuple(segments), candidate)
 

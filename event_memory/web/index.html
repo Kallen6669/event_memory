@@ -1,8 +1,8 @@
 <!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="local-token" content="__SESSION_TOKEN__"><title>经历记忆 · 本地工作台</title>
-<link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<meta name="local-token" content="__SESSION_TOKEN__"><meta name="local-store" content="__STORE_ID__"><title>经历记忆 · 本地工作台</title>
+<link rel="stylesheet" href="/style.css"><script src="/operations.js" defer></script><script src="/app.js" defer></script></head>
 <body>
 <header><div><p class="eyebrow">本地工作台</p><h1>经历记忆</h1><p>从每一次讨论，回到有据可查的原话。</p></div><span class="badge">候选材料 · 探索结果</span></header>
 <main>
@@ -15,6 +15,6 @@
 <div class="row selection"><span id="selected">已选 0 条</span><input id="purpose" placeholder="本次导出用途" aria-label="导出用途"><button id="export">固定范围并导出</button></div>
 <div id="events" class="events"></div><div class="row"><button id="previous">上一页</button><span id="page"></span><button id="next">下一页</button></div></section>
 <section id="detail" class="panel" hidden></section>
-<p id="message" role="status" aria-live="polite"></p>
+<button id="check-operation" class="secondary">核对上次操作</button><p id="message" role="status" aria-live="polite"></p>
 </main><footer>经历概括是带原文依据的解释。原文中的提议、条件和声称完成，不自动等同于已验证的现实事实。</footer>
 </body></html>

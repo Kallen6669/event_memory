@@ -10,7 +10,7 @@ from .chatgpt_auth import API, ProbeError, authorized_profile, principal_hash
 from .config import ChatGPTConfig
 from .errors import MemoryError
 from .model import Ledger, NoRedirect
-from .store import dumps
+from .store import dumps, fingerprint
 
 
 class TrackedHTTPSConnection(http.client.HTTPSConnection):
@@ -55,12 +55,30 @@ class ChatGPTModel:
     def __init__(self, config: ChatGPTConfig, ledger: Ledger):
         self.config, self.ledger = config, ledger
 
-    def replay(self, call_id: str, job_id: str):
+    def saved_messages(self, call_id: str, job_id: str):
+        row = self.ledger.get(call_id)
+        if not row:
+            return None
+        self._check_identity(row, job_id)
+        if not row["request_payload"] or row["content_cleared"]:
+            raise MemoryError("cleared", "原请求上下文已清除或不可恢复。")
+        payload = json.loads(row["request_payload"])
+        if fingerprint(payload) != row["request_hash"]:
+            raise MemoryError("request_conflict", "原请求正文与保存摘要不一致。")
+        messages = [{"role": "system", "content": payload["instructions"]}] if payload["instructions"] else []
+        return messages + payload["input"]
+
+    def _check_identity(self, row, job_id):
+        if row["job_id"] != job_id or row["model"] != self.config.model or row["billing_path"] != "chatgpt_plan" or row["principal_hash"] != self.config.principal_hash:
+            raise MemoryError("request_conflict", "原结果不属于本作业、模型或当前授权账号。")
+
+    def replay(self, call_id: str, job_id: str, messages=None):
         row = self.ledger.get(call_id)
         if not row or row["state"] != "received":
             return None
-        if row["job_id"] != job_id or row["model"] != self.config.model or row["billing_path"] != "chatgpt_plan" or row["principal_hash"] != self.config.principal_hash:
-            raise MemoryError("request_conflict", "原结果不属于本作业、模型或当前授权账号。")
+        self._check_identity(row, job_id)
+        if messages is None or row["request_hash"] != fingerprint(self.payload(self.config.model, messages)):
+            raise MemoryError("request_conflict", "重放输入与原请求不同，禁止套用原响应。")
         if row["response"] is None:
             raise MemoryError("cleared", "原模型结果已经清除，不允许通过重发恢复。")
         return self.decode(json.loads(row["response"]))
@@ -81,7 +99,7 @@ class ChatGPTModel:
                 "input": inputs, "store": False, "stream": True}
 
     def generate(self, call_id: str, job_id: str, messages: list[dict]) -> dict:
-        saved = self.replay(call_id, job_id)
+        saved = self.replay(call_id, job_id, messages)
         if saved is not None:
             return saved
         try:

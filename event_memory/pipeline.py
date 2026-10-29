@@ -6,7 +6,7 @@ from typing import Callable
 
 from .errors import InvalidOutput, MemoryError
 from .prompt import PROMPT_VERSION, SYSTEM_PROMPT, LEGACY_PROMPT_VERSION, LEGACY_SYSTEM_PROMPT
-from .context import compact_payload
+from .context import compact_payload, expand_reading
 from .store import Store, dumps, fingerprint
 from .transcript import build_batches, parse_transcript
 from .validation import CONDITIONAL, validate_output
@@ -16,6 +16,9 @@ class Pipeline:
     def __init__(self, store: Store, model, on_progress: Callable[[dict], None] | None = None):
         self.store, self.model = store, model
         self.on_progress = on_progress or (lambda _: None)
+        ledger = getattr(model, "ledger", None)
+        if ledger is not None:
+            ledger.bind_store(store)
 
     def process(self, owner: str, source_id: str, operation_key: str,
                 batch_chars: int = 6000, context_chars: int = 900) -> dict:
@@ -64,7 +67,12 @@ class Pipeline:
                 batch = batches[index]
                 text = "\n".join(row["text"] for row in batch["primary"])
                 compact = settings["prompt_version"] == PROMPT_VERSION
-                candidates = self.store.candidates(owner, text, job_id, full_summary=compact)
+                frozen = self.store.frozen_input(owner, job_id, index)
+                saved_messages = getattr(self.model, "saved_messages", lambda *_: None)
+                original = saved_messages(f"{job_id}:{index}:0", job_id) if frozen is None else None
+                candidates = (frozen["candidates"] if frozen else
+                              json.loads(original[1]["content"])["candidates"] if original else
+                              self.store.candidates(owner, text, job_id, full_summary=compact))
                 payload = {**batch, "candidates": candidates,
                            "source": {"recording": source["recording"], "revision": source["revision"],
                                       "transcript_version": source["transcript_version"],
@@ -75,12 +83,29 @@ class Pipeline:
                     payload = compact_payload(batch, candidates, payload["source"], settings.get("review_focus"))
                 base_messages = [{"role": "system", "content": SYSTEM_PROMPT if compact else LEGACY_SYSTEM_PROMPT},
                             {"role": "user", "content": dumps(payload)}]
+                if original:
+                    if candidates["events"] or candidates["topics"]:
+                        raise MemoryError("dependency_untracked", "历史请求没有完整的输入依赖版本记录，保留原响应并停止；请先复核，不能按当前版本补造历史。")
+                    base_messages = original
+                    restored = expand_reading(json.loads(original[1]["content"]))
+                    expected = {r["ref"]: r["text"] for r in batch["context"] + batch["primary"]}
+                    actual = {r["ref"]: r["text"] for r in restored["context"] + restored["primary"]}
+                    if actual != expected:
+                        raise MemoryError("request_conflict", "原请求的阅读范围或正文与固定来源不一致。")
+                frozen = self.store.frozen_input(owner, job_id, index, {
+                    "batch": batch, "candidates": candidates, "messages": base_messages})
+                batch, candidates, base_messages = frozen["batch"], frozen["candidates"], frozen["messages"]
                 messages = base_messages
                 validated = None
                 for attempt in range(4):
                     call_id = f"{job_id}:{index}:{attempt}"
+                    original_attempt = saved_messages(call_id, job_id)
+                    if original_attempt is not None:
+                        if original_attempt[:len(base_messages)] != base_messages:
+                            raise MemoryError("request_conflict", "恢复请求的原始阅读上下文与批次快照不同。")
+                        messages = original_attempt
                     replay = getattr(self.model, "replay", None)
-                    response = replay(call_id, job_id) if replay else None
+                    response = replay(call_id, job_id, messages) if replay else None
                     self.on_progress({"job_id": job_id, "batch": index+1, "total_batches": len(batches),
                                       "attempt": attempt+1, "cached": response is not None})
                     if response is None:
@@ -111,10 +136,11 @@ class Pipeline:
                     for row in transcript.segments if row.kind == "acoustic" and settings.get("kind") != "salient_refinement"))
             self.store.finish(owner, job_id)
         except MemoryError as exc:
-            if exc.code in {"cleared", "cancelled", "permission_denied", "stale_source"}:
+            if exc.code in {"cleared", "cancelled", "permission_denied", "stale_source", "dependency_changed"}:
                 ledger = getattr(self.model, "ledger", None)
                 if ledger:
                     ledger.purge_jobs([job_id])
+                    self.store.flush_purges(ledger)
             try:
                 self.store.job_state(owner, job_id, "unknown" if exc.code == "unknown_call" else "failed", exc.code)
             except MemoryError:
@@ -126,6 +152,10 @@ class Pipeline:
             except MemoryError:
                 pass
             raise MemoryError("local_processing_error", "本地处理异常；已保留原操作身份和已保存的合法结果，请修复后恢复。") from None
+        finally:
+            ledger = getattr(self.model, "ledger", None)
+            if ledger is not None:
+                self.store.flush_purges(ledger)
         return self.summary(owner, job_id)
 
     def refine_unclassified(self, owner: str, parent_job_id: str) -> dict:

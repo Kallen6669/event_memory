@@ -26,9 +26,10 @@ async function api(path,body){
   }
   );
   const value=await response.json();
-  if(!response.ok)throw new Error(value.message||"本地请求失败");
+  if(!response.ok){const error=new Error(value.message||"本地请求失败");error.status=response.status;error.code=value.error;throw error;}
   return value;
 }
+const operations=LocalOperations.create({api,storage:localStorage,randomUUID:()=>crypto.randomUUID(),namespace:document.querySelector('meta[name="local-store"]').content});
 function action(label,fn,secondary=false){
   const b=node("button",label,secondary?"secondary":"");
   b.addEventListener("click",async()=>{
@@ -113,7 +114,7 @@ async function showDetail(id){
   names.value=event.topics.map(t=>t.name).join("，");
   names.setAttribute("aria-label","主题名称，用中文逗号分隔");
   row.append(names,action("保存主题纠正",async()=>{
-    await api(`/api/events/${id}/topics`,{
+    await operations.submit(`/api/events/${id}/topics`,"correct_topics",{
       revision:event.association_revision,names:names.value.split(/[，,]/).map(s=>s.trim()).filter(Boolean)
     }
     );
@@ -251,7 +252,7 @@ $("export").addEventListener("click",async()=>{
     if(!selected.size)throw new Error("请先勾选经历。");
     const purpose=$("purpose").value.trim();
     if(!purpose)throw new Error("请填写本次导出用途。");
-    const snapshot=await api("/api/selections",{
+    const snapshot=await operations.submit("/api/selections","select",{
       event_ids:[...selected],purpose
     }
     );
@@ -278,4 +279,16 @@ async function initial(){
   await loadEvents();
 }
 initial().catch(e=>message(e.message,true));
+$("check-operation").addEventListener("click",async()=>{
+  try{
+    const receipt=await operations.recover();
+    message(`操作 ${receipt.operation_id}：${receipt.status==="applied"?"已执行":"已清除"}；${receipt.current_state==="valid"?"结果当前有效":receipt.current_state==="changed"?"之后已有新修订":"结果已不可用"}。`);
+    if(receipt.kind==="select"&&receipt.current_state==="valid"&&receipt.result){
+      const data=await api("/api/selections/"+receipt.result.id);
+      const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:"application/json;charset=utf-8"}));
+      const link=node("a");link.href=url;link.download="经历选择-"+receipt.result.id+".json";link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    }
+    await loadTopics();await loadEvents();
+  }catch(error){message(error.message,true);}
+});
 setInterval(()=>refreshStatus().catch(e=>message(e.message,true)),10000);

@@ -18,13 +18,13 @@ def table_exists(db, name):
     return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
 
-def backup_before_migration(db, path):
+def backup_before_migration(db, path, target_version=2):
     if str(path) == ":memory:":
         return None
     source = Path(path).resolve()
     directory = source.parent / "migration-backups"
     directory.mkdir(exist_ok=True)
-    target = directory / (source.name + ".before-v2-" + uuid.uuid4().hex[:10] + ".sqlite")
+    target = directory / (source.name + f".before-v{target_version}-" + uuid.uuid4().hex[:10] + ".sqlite")
     saved = sqlite3.connect(target)
     try:
         db.backup(saved)
@@ -34,6 +34,25 @@ def backup_before_migration(db, path):
 
 
 def migrate_business(db, path, schema):
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version > 5:
+        raise MemoryError("unsupported_schema", "数据库版本高于当前程序支持范围，未进行降级或修改。")
+    if version < 2:
+        _migrate_business_v2(db, path, schema)
+    if version < 5:
+        if version in {2, 3, 4}:
+            backup_before_migration(db, path, 5)
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            execute_schema(db, schema)
+            db.execute("PRAGMA user_version=5")
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+
+
+def _migrate_business_v2(db, path, schema):
     version = db.execute("PRAGMA user_version").fetchone()[0]
     if version > 2:
         raise MemoryError("unsupported_schema", "数据库版本高于当前程序支持范围，未进行降级或修改。")

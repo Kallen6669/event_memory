@@ -56,6 +56,7 @@ def export_selection(store: Store, owner: str, selection_id: str) -> dict:
 def parser() -> argparse.ArgumentParser:
     p = ChineseParser(description="离线转录文档的事件、主题与原文查询")
     p.add_argument("--db", default=str(DEFAULT_DB), help="本地事实数据库路径")
+    p.add_argument("--ledger", default=str(DEFAULT_LEDGER), help="与事实库配套的调用账本；独立测试库请同时指定")
     p.add_argument("--owner", default="local", help="可信本地账号命名空间，不等同于远程身份认证")
     commands = p.add_subparsers(dest="command", required=True, title="操作")
     for name, help_text in (("inspect", "只解析文档并查看批次，不调用模型"),
@@ -86,9 +87,13 @@ def parser() -> argparse.ArgumentParser:
     child.add_argument("event_id")
     child.add_argument("--revision", type=int, required=True)
     child.add_argument("--topics", nargs="*", default=[])
+    child.add_argument("--operation-id", help="重复提交和结果核对使用的稳定操作编号")
     child = commands.add_parser("select", help="固定事件版本、关联修订及证据集合")
     child.add_argument("event_ids", nargs="+")
     child.add_argument("--purpose", required=True)
+    child.add_argument("--operation-id", help="重复提交和结果核对使用的稳定操作编号")
+    child = commands.add_parser("operation", help="凭原操作编号核对纠正或固定选择的结果")
+    child.add_argument("operation_id")
     child = commands.add_parser("export", help="导出先前选定的固定内容")
     child.add_argument("selection_id")
     child.add_argument("--out", required=True)
@@ -149,7 +154,7 @@ def main(argv=None) -> int:
             return 0
         if args.command == "serve":
             from .server import serve
-            serve(Path(args.db), args.owner, args.port)
+            serve(Path(args.db), args.owner, args.port, Path(args.ledger))
             return 0
         if args.command == "evaluate-cases":
             if args.report_only:
@@ -181,7 +186,7 @@ def main(argv=None) -> int:
                 raise MemoryError("invalid_mode", "报告的模型/策略选择只适用于只读报告；真实调用使用当前已授权模型及策略。")
             from .evaluation import run_cases
             store = Store(ROOT / ".runtime" / "semantic-evaluation.sqlite")
-            ledger = Ledger(DEFAULT_LEDGER, configured_budget())
+            ledger = Ledger(args.ledger, configured_budget())
             result = run_cases(store, create_model(ledger), Path(args.cases))
             target = Path(args.out)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -190,8 +195,9 @@ def main(argv=None) -> int:
                   "cases": len(result["results"]), "budget": ledger.summary()})
             return 0 if result["passed_defined_checks"] else 1
         store = Store(args.db)
-        if args.command in {"process", "resume", "refine", "budget", "reconcile", "clear", "migrate"}:
-            ledger = Ledger(DEFAULT_LEDGER, configured_budget())
+        if args.command in {"process", "resume", "refine", "budget", "reconcile", "clear", "migrate", "revoke"}:
+            ledger = Ledger(args.ledger, configured_budget())
+            ledger.bind_store(store)
         if args.command in {"import", "process"}:
             source = store.import_source(args.owner, read_text(args.file), args.recording_id or Path(args.file).name, args.revision)
             if args.command == "import":
@@ -221,9 +227,15 @@ def main(argv=None) -> int:
             event = store.event(args.owner, args.event_id)
             emit({"event": event, "evidence": store.evidence(args.owner, event["source_id"], event["refs"])})
         elif args.command == "correct":
-            emit(store.correct_topics(args.owner, args.event_id, args.revision, args.topics))
+            operation_id = store.operation_id(args.operation_id)
+            print("本次操作编号："+operation_id, file=sys.stderr, flush=True)
+            emit(store.correct_topics(args.owner, args.event_id, args.revision, args.topics, operation_id))
         elif args.command == "select":
-            emit(store.select(args.owner, args.event_ids, args.purpose))
+            operation_id = store.operation_id(args.operation_id)
+            print("本次操作编号："+operation_id, file=sys.stderr, flush=True)
+            emit(store.select(args.owner, args.event_ids, args.purpose, operation_id))
+        elif args.command == "operation":
+            emit(store.operation(args.owner, args.operation_id))
         elif args.command == "export":
             value = export_selection(store, args.owner, args.selection_id)
             target = Path(args.out)
@@ -235,14 +247,14 @@ def main(argv=None) -> int:
             emit({"status": "cancelled"})
         elif args.command in {"revoke", "grant"}:
             store.set_access(args.owner, args.command == "grant")
+            if ledger is not None:
+                store.flush_purges(ledger)
             emit({"access": args.command})
         elif args.command == "clear":
-            job_ids = [r[0] for r in store.db.execute("SELECT j.id FROM jobs j JOIN sources s ON s.id=j.source_id WHERE j.owner=? AND s.recording=?", (args.owner, args.recording_id))]
-            store.clear_recording(args.owner, args.recording_id)
-            ledger.purge_jobs(job_ids)
+            store.clear_recording(args.owner, args.recording_id, ledger)
             emit({"status": "cleared", "recording": args.recording_id})
         elif args.command == "migrate":
-            emit({"database": str(Path(args.db).resolve()), "ledger": str(DEFAULT_LEDGER.resolve()), "schema_version": 2, "status": "migrated", "model_calls_started": 0})
+            emit({"database": str(Path(args.db).resolve()), "ledger": str(Path(args.ledger).resolve()), "schema_version": store.db.execute("PRAGMA user_version").fetchone()[0], "status": "migrated", "model_calls_started": 0})
         elif args.command == "budget":
             emit(ledger.summary())
         elif args.command == "reconcile":

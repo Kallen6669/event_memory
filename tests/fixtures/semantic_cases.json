@@ -1,0 +1,28 @@
+{
+  "role": "synthetic_acceptance",
+  "authored_by": "implementation_author",
+  "independent_reviewed": false,
+  "criteria": "预先指定的关键主张类型必须保留；程序检查不替代独立真实语义验收。",
+  "cases": [
+    {
+      "id": "condition",
+      "text": "[10:00:00 – 10:00:04] SPK_1: 如果实验准确率低于百分之九十，才考虑改用net2；现在先继续使用net1。\n",
+      "required_claim_kinds": ["condition"]
+    },
+    {
+      "id": "cancellation",
+      "text": "[10:00:00 – 10:00:04] SPK_1: 先别发邮件，刚才的发送安排取消了。\n",
+      "required_claim_kinds": ["cancellation"]
+    },
+    {
+      "id": "denial",
+      "text": "[10:00:00 – 10:00:03] SPK_1: 我说的是论文甲，不是论文乙。\n[10:00:04 – 10:00:07] SPK_2: 明白，论文甲的方法还只是提议，没有决定换方案。\n",
+      "required_claim_kinds": ["denial"]
+    },
+    {
+      "id": "claimed-completion",
+      "text": "[10:00:00 – 10:00:03] SPK_1: 我已经把材料发出去了。\n[10:00:04 – 10:00:07] SPK_2: 我还没确认收到。\n",
+      "required_claim_kinds": ["claimed_completion", "denial"]
+    }
+  ]
+}

@@ -101,6 +101,28 @@ class Ledger:
 
     def close(self):self.db.close()
 
+    def bind_store(self, store):
+        self._store = store
+        self._sync_purges()
+
+    def _sync_purges(self):
+        if getattr(self, '_store', None) is not None and not self.db.in_transaction and not getattr(self, '_syncing', False):
+            self._syncing = True
+            try:
+                self._store.flush_purges(self)
+            finally:
+                self._syncing = False
+
+    def _check_not_purged(self, job_id):
+        self._sync_purges()
+        if getattr(self, '_store', None) is not None and self._store.db.execute('SELECT 1 FROM content_purges WHERE job_id=?', (job_id,)).fetchone():
+            raise MemoryError('cleared', '该作业的输入或依赖已清除，禁止重新发送。')
+        if getattr(self, '_store', None) is not None:
+            job = self._store.db.execute('SELECT owner FROM jobs WHERE id=?', (job_id,)).fetchone()
+            if not job:
+                raise MemoryError('not_found', '待发送请求不属于绑定事实库中的有效作业。')
+            self._store.check_job(job['owner'], job_id)
+
     @contextmanager
     def transaction(self):
         self.db.execute('BEGIN IMMEDIATE')
@@ -112,6 +134,7 @@ class Ledger:
             raise
 
     def get(self,call_id):
+        self._sync_purges()
         row=self.db.execute('SELECT * FROM calls WHERE id=?',(call_id,)).fetchone()
         return dict(row) if row else None
 
@@ -136,6 +159,7 @@ class Ledger:
                         (call_id,job_id,fingerprint(payload),'pending',payload['model'],billing,identity,dumps(payload),dumps(metadata),now(),now()))
 
     def reserve(self,call_id,job_id,payload,reservation):
+        self._check_not_purged(job_id)
         if type(reservation) is not int or reservation<0:
             raise MemoryError('invalid_reservation','预算预留须为非负整数微元。')
         with self.transaction():
@@ -149,6 +173,7 @@ class Ledger:
             self._insert(call_id,job_id,payload,'deepseek_api',None,{'reserved':reservation,'pricing_basis':'cny_peak_cache_20261027'})
 
     def reserve_subscription(self,call_id,job_id,payload,identity,limit):
+        self._check_not_purged(job_id)
         with self.transaction():
             row=self.get(call_id)
             if row:
@@ -175,6 +200,7 @@ class Ledger:
         self.db.execute('UPDATE model_calls SET '+','.join(k+'=?' for k in columns)+' WHERE id=?',[*columns.values(),call_id])
 
     def received(self,call_id,response,charged,elapsed):
+        self._sync_purges()
         with self.transaction():
             row=self.get(call_id)
             if not row:raise MemoryError('not_found','模型调用不存在。')
@@ -207,5 +233,5 @@ class Ledger:
     def purge_jobs(self,job_ids):
         with self.transaction():
             for job_id in job_ids:
-                for row in self.db.execute('SELECT * FROM calls WHERE job_id=?',(job_id,)).fetchall():
+                for row in self.db.execute('SELECT * FROM calls WHERE job_id=? AND content_cleared=0',(job_id,)).fetchall():
                     self._update(row['id'],row['state'],{'content_cleared':1,'usage':_small_usage(row['usage'])},response=None,request_payload=None)

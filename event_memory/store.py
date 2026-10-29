@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -72,6 +73,17 @@ CREATE TABLE IF NOT EXISTS unclassified(job_id TEXT REFERENCES jobs(id),ref TEXT
 CREATE TABLE IF NOT EXISTS batch_results(job_id TEXT REFERENCES jobs(id),batch_index INTEGER,result_hash TEXT NOT NULL,warnings TEXT NOT NULL,
  PRIMARY KEY(job_id,batch_index));
 CREATE TABLE IF NOT EXISTS selections(id TEXT PRIMARY KEY,owner TEXT,epoch INTEGER,payload TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS batch_inputs(job_id TEXT NOT NULL REFERENCES jobs(id),batch_index INTEGER NOT NULL,
+ context TEXT,PRIMARY KEY(job_id,batch_index));
+CREATE TABLE IF NOT EXISTS input_dependencies(job_id TEXT NOT NULL REFERENCES jobs(id),batch_index INTEGER NOT NULL,
+ source_id TEXT NOT NULL,event_id TEXT NOT NULL,parent_job_id TEXT NOT NULL,event_version INTEGER NOT NULL,
+ association_revision INTEGER NOT NULL,source_hash TEXT NOT NULL,epoch INTEGER NOT NULL,
+ PRIMARY KEY(job_id,batch_index,source_id,event_id));
+CREATE INDEX IF NOT EXISTS dependency_parent ON input_dependencies(parent_job_id,job_id);
+CREATE TABLE IF NOT EXISTS content_purges(job_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS operation_receipts(owner TEXT NOT NULL,operation_id TEXT NOT NULL,
+ kind TEXT NOT NULL,request_hash TEXT NOT NULL,epoch INTEGER NOT NULL,event_ids TEXT NOT NULL,
+ result TEXT,created_at TEXT NOT NULL,PRIMARY KEY(owner,operation_id));
 """
 
 
@@ -124,7 +136,10 @@ class Store:
             self.account(owner)
             self.db.execute("UPDATE accounts SET epoch=epoch+1,active=? WHERE owner=?", (int(active), owner))
             if not active:
-                self.db.execute("UPDATE jobs SET status='cancelled',updated_at=? WHERE owner=? AND status IN ('queued','running','unknown','failed')", (now(), owner))
+                ids = [r[0] for r in self.db.execute("SELECT id FROM jobs WHERE owner=?", (owner,))]
+                self._invalidate_jobs(ids, clear=True)
+                self.db.execute("UPDATE operation_receipts SET result=NULL WHERE owner=?", (owner,))
+                self.db.execute("DELETE FROM topics WHERE owner=? AND id NOT IN (SELECT topic_id FROM associations)", (owner,))
 
     def import_source(self, owner: str, raw: str, recording: str,
                       revision: str | None = None, transcript_version: str = "1",
@@ -147,6 +162,10 @@ class Store:
                 if existing["state"] != "current":
                     raise MemoryError("stale_source", "旧修订不可重新变成当前来源。")
                 return dict(existing)
+            old_jobs = [r[0] for r in self.db.execute("SELECT j.id FROM jobs j JOIN sources s ON s.id=j.source_id WHERE s.owner=? AND s.recording=? AND s.state='current'", (owner, recording))]
+            if old_jobs:
+                old_jobs.extend(r[0] for r in self.db.execute("SELECT id FROM jobs WHERE owner=? AND id NOT IN (SELECT job_id FROM input_dependencies WHERE batch_index=-1)", (owner,)))
+            self._invalidate_jobs(self._dependent_jobs(old_jobs))
             self.db.execute("UPDATE sources SET state='stale' WHERE owner=? AND recording=? AND state='current'", (owner, recording))
             self.db.execute("INSERT INTO sources VALUES(?,?,?,?,?,?,?,?,?,?)", (
                 source_id, owner, recording, revision, transcript_version, parsed.content_hash,
@@ -226,6 +245,9 @@ class Store:
             self.db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
                 job_id, owner, operation_key, source_id, account["epoch"],
                 "queued", 0, dumps(settings), None, now(), now()))
+            source = self.source(owner, source_id)
+            self.db.execute("INSERT INTO input_dependencies VALUES(?,?,?,?,?,?,?,?,?)",
+                            (job_id, -1, source_id, "", job_id, 0, 0, source["content_hash"], account["epoch"]))
         return self.job(owner, job_id)
 
     def job(self, owner: str, job_id: str) -> dict:
@@ -241,7 +263,58 @@ class Store:
         self.source(owner, job["source_id"])
         if job["status"] == "cancelled":
             raise MemoryError("cancelled", "作业已取消，禁止迟到发布。")
+        if job["status"] == "invalidated":
+            raise MemoryError("dependency_changed", "历史输入依赖已变化，原解释已失效，不能原地重新发布。")
+        self._check_dependencies(job)
         return job
+
+    def _check_dependencies(self, job):
+        for dependency in self.db.execute("SELECT * FROM input_dependencies WHERE job_id=?", (job["id"],)):
+            source = self.db.execute("SELECT * FROM sources WHERE id=? AND owner=?", (dependency["source_id"], job["owner"])).fetchone()
+            self.authorize(job["owner"], dependency["epoch"])
+            if not source or source["state"] != "current" or source["content_hash"] != dependency["source_hash"]:
+                raise MemoryError("dependency_changed", "曾提供给模型的来源已清除或过时，禁止发布和消费。")
+            if dependency["event_id"] and dependency["parent_job_id"] != job["id"]:
+                event = self.db.execute("SELECT e.version,e.association_revision,j.status FROM events e JOIN jobs j ON j.id=e.job_id WHERE e.id=?", (dependency["event_id"],)).fetchone()
+                if not event or (event["version"], event["association_revision"], event["status"]) != (dependency["event_version"], dependency["association_revision"], "succeeded"):
+                    raise MemoryError("dependency_changed", "曾提供给模型的经历或主题关联版本已失效。")
+
+    def _dependent_jobs(self, roots):
+        affected, frontier = set(roots), set(roots)
+        while frontier:
+            following = set()
+            for parent in frontier:
+                following.update(r[0] for r in self.db.execute("SELECT DISTINCT job_id FROM input_dependencies WHERE parent_job_id=?", (parent,)))
+            frontier = following - affected
+            affected.update(frontier)
+        return affected
+
+    def _invalidate_jobs(self, job_ids, clear=False):
+        for job_id in set(job_ids):
+            self.db.execute("UPDATE jobs SET status=?,error=?,updated_at=? WHERE id=? AND (status<>'cancelled' OR ?)", (
+                "cancelled" if clear else "invalidated", "dependency_cleared" if clear else "dependency_changed", now(), job_id, int(clear)))
+            if not clear:
+                continue
+            self.db.execute("INSERT OR IGNORE INTO content_purges VALUES(?)", (job_id,))
+            event_ids = {r[0] for r in self.db.execute("SELECT id FROM events WHERE job_id=?", (job_id,))}
+            for receipt in self.db.execute("SELECT owner,operation_id,event_ids FROM operation_receipts WHERE result IS NOT NULL").fetchall():
+                if event_ids.intersection(json.loads(receipt["event_ids"])):
+                    self.db.execute("UPDATE operation_receipts SET result=NULL WHERE owner=? AND operation_id=?", (receipt["owner"], receipt["operation_id"]))
+            for row in self.db.execute("SELECT id,payload FROM selections").fetchall():
+                if any(e["id"] in event_ids for e in json.loads(row["payload"])["events"]):
+                    self.db.execute("DELETE FROM selections WHERE id=?", (row["id"],))
+            for event_id in event_ids:
+                self.db.execute("DELETE FROM associations WHERE event_id=?", (event_id,))
+                self.db.execute("DELETE FROM corrections WHERE event_id=?", (event_id,))
+            self.db.execute("DELETE FROM events WHERE job_id=?", (job_id,))
+            self.db.execute("DELETE FROM unclassified WHERE job_id=?", (job_id,))
+            self.db.execute("DELETE FROM batch_results WHERE job_id=?", (job_id,))
+            self.db.execute("UPDATE batch_inputs SET context=NULL WHERE job_id=?", (job_id,))
+
+    def flush_purges(self, ledger):
+        ids = [r[0] for r in self.db.execute("SELECT job_id FROM content_purges")]
+        if ids:
+            ledger.purge_jobs(ids)
 
     def job_state(self, owner: str, job_id: str, state: str, error: str | None = None):
         with self.transaction():
@@ -319,6 +392,48 @@ class Store:
             self.db.execute("INSERT INTO batch_results VALUES(?,?,?,?)", (job_id, batch_index, fingerprint(output), dumps(output.get("normalization_warnings", []))))
             self.db.execute("UPDATE jobs SET next_batch=next_batch+1,updated_at=? WHERE id=?", (now(), job_id))
 
+    def frozen_input(self, owner: str, job_id: str, batch_index: int, value: dict | None = None):
+        with self.transaction():
+            self.check_job(owner, job_id)
+            row = self.db.execute("SELECT context FROM batch_inputs WHERE job_id=? AND batch_index=?", (job_id, batch_index)).fetchone()
+            if row:
+                if row[0] is None:
+                    raise MemoryError("cleared", "原请求上下文已清除，不允许重新构造。")
+                frozen = json.loads(row[0])
+                if not frozen.get("dependencies_tracked"):
+                    raise MemoryError("dependency_untracked", "历史批次缺少实际输入依赖记录，不能冒充已核验的恢复；请先审查原请求。")
+                return frozen
+            if value is not None:
+                self._capture_dependencies(owner, job_id, batch_index, value["candidates"])
+                value = {**value, "dependencies_tracked": True}
+                self.db.execute("INSERT INTO batch_inputs VALUES(?,?,?)", (job_id, batch_index, dumps(value)))
+            return value
+
+    def _capture_dependencies(self, owner, job_id, batch_index, candidates):
+        events = {e["id"]: e for e in candidates["events"]}
+        for topic in candidates["topics"]:
+            row = self.db.execute("SELECT name FROM topics WHERE id=? AND owner=?", (topic["id"], owner)).fetchone()
+            if not row or row[0] != topic["name"]:
+                raise MemoryError("dependency_changed", "送入模型的主题候选已变化。")
+            if not topic.get("input_events"):
+                raise MemoryError("dependency_untracked", "主题候选缺少首次读取时的来源版本，不能补造历史依赖。")
+            for event in topic["input_events"]:
+                events.setdefault(event["id"], event)
+        for candidate in events.values():
+            event = self.db.execute("SELECT * FROM event_details WHERE id=? AND owner=?", (candidate["id"], owner)).fetchone()
+            if not event:
+                raise MemoryError("dependency_changed", "实际历史候选已不可用。")
+            parent = self.check_job(owner, event["job_id"])
+            if parent["id"] != job_id and parent["status"] != "succeeded":
+                raise MemoryError("dependency_changed", "历史候选尚未发布或已经失效。")
+            for key in ("version", "association_revision", "source_id"):
+                if key in candidate and candidate[key] != event[key]:
+                    raise MemoryError("dependency_changed", "历史候选版本在构建输入时发生变化。")
+            source = self.source(owner, event["source_id"])
+            self.db.execute("INSERT OR IGNORE INTO input_dependencies VALUES(?,?,?,?,?,?,?,?,?)", (
+                job_id, batch_index, source["id"], event["id"], event["job_id"], event["version"],
+                event["association_revision"], source["content_hash"], self.authorize(owner)["epoch"]))
+
     def finish(self, owner: str, job_id: str):
         with self.transaction():
             job = self.check_job(owner, job_id)
@@ -383,10 +498,12 @@ class Store:
             "JOIN jobs j ON j.id=e.job_id WHERE e.id=? AND e.owner=?",
             (relation["target_id"], owner)).fetchone()
         status, reason = "valid", None
-        if not target or target["status"] != "succeeded" or target["state"] == "cleared":
+        if not target or target["state"] == "cleared":
             status, reason = "unavailable", "target_unavailable"
         elif target["state"] != "current":
             status, reason = "stale", "target_source_revised"
+        elif target["status"] != "succeeded":
+            status, reason = "unavailable", "target_unavailable"
         elif relation.get("target_version") is not None and relation["target_version"] != target["version"]:
             status, reason = "stale", "target_version_changed"
         return {**relation, "status": status, "invalid_reason": reason, "semantic_status": "candidate",
@@ -398,11 +515,16 @@ class Store:
         if not row:
             raise MemoryError("not_found", "经历不存在、尚未完成或不属于当前账号。")
         self.source(owner, row["source_id"])
+        self._check_dependencies(self.job(owner, row["job_id"]))
         return self._event_dict(row)
 
     def candidates(self, owner: str, query: str, job_id: str, limit: int = 12, full_summary: bool = False) -> dict:
+        with self.transaction():
+            return self._candidates(owner, query, job_id, limit, full_summary)
+
+    def _candidates(self, owner, query, job_id, limit, full_summary):
         self.authorize(owner)
-        rows = self.db.execute("SELECT e.id,e.title,e.summary,e.job_id,e.source_id FROM event_details e JOIN sources s ON s.id=e.source_id JOIN jobs j ON j.id=e.job_id WHERE e.owner=? AND s.state='current' AND (j.status='succeeded' OR e.job_id=?)", (owner, job_id))
+        rows = self.db.execute("SELECT e.id,e.title,e.summary,e.job_id,e.source_id,e.version,e.association_revision FROM event_details e JOIN sources s ON s.id=e.source_id JOIN jobs j ON j.id=e.job_id WHERE e.owner=? AND s.state='current' AND (j.status='succeeded' OR e.job_id=?)", (owner, job_id))
         grams = {query[i:i+2] for i in range(len(query)-1)}
         ranked = []
         for row in rows:
@@ -430,17 +552,81 @@ class Store:
             related_score = related_topic_scores.get(topic["id"], 0)
             return (-(name_score + related_score), -name_score, -related_score, topic["name"], topic["id"])
         topics.sort(key=topic_rank)
+        topics = topics[:80]
+        for topic in topics:
+            topic["input_events"] = [dict(r) for r in self.db.execute(
+                "SELECT e.id,e.source_id,e.job_id,e.version,e.association_revision FROM event_details e JOIN associations a ON a.event_id=e.id JOIN jobs j ON j.id=e.job_id JOIN sources s ON s.id=e.source_id WHERE a.topic_id=? AND e.owner=? AND s.state='current' AND (j.status='succeeded' OR e.job_id=?)",
+                (topic["id"], owner, job_id))]
         return {"events": chosen, "topics": topics[:80],
                 "scope": {"owner_filtered": True, "event_limit": limit,
                           "topic_limit": 80, "topic_total": len(topics), "topic_method": "name_and_recalled_events",
                           "method": "local_character_bigram", "relation_is_suggestion": True}}
 
-    def correct_topics(self, owner: str, event_id: str, expected_revision: int, names: list[str]) -> dict:
+    @staticmethod
+    def operation_id(value=None):
+        value = uuid.uuid4().hex if value is None else value
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+            raise MemoryError("invalid_operation", "操作编号须为1—128位字母、数字或_.:-。")
+        return value
+
+    def operation(self, owner: str, operation_id: str):
+        account = self.authorize(owner)
+        operation_id = self.operation_id(operation_id)
+        row = self.db.execute("SELECT * FROM operation_receipts WHERE owner=? AND operation_id=?", (owner, operation_id)).fetchone()
+        if not row:
+            raise MemoryError("not_found", "未找到该账号的操作回执；不代表未知请求一定未执行，请保留原编号核对。")
+        receipt = {k: row[k] for k in ("operation_id", "kind", "request_hash", "created_at")}
+        if row["result"] is None or row["epoch"] != account["epoch"]:
+            return {**receipt, "status":"cleared", "current_state":"unavailable", "result":None}
+        result = json.loads(row["result"])
+        current_state = "valid"
+        try:
+            if row["kind"] == "correct_topics":
+                event = self.event(owner, result["id"])
+                if event["association_revision"] != result["association_revision"]:
+                    current_state = "changed"
+            else:
+                self.selection(owner, result["id"])
+        except MemoryError:
+            current_state = "unavailable"
+        return {**receipt, "status":"applied", "current_state":current_state,
+                "result":result if current_state != "unavailable" else None}
+
+    def _operation_replay(self, owner, operation_id, kind, request):
+        row = self.db.execute("SELECT kind,request_hash FROM operation_receipts WHERE owner=? AND operation_id=?", (owner, operation_id)).fetchone()
+        if row is None:
+            return None
+        if row["kind"] != kind or row["request_hash"] != fingerprint(request):
+            raise MemoryError("operation_conflict", "操作编号已对应其他参数或类型，不允许用新请求覆盖原回执。")
+        receipt = self.operation(owner, operation_id)
+        if receipt["result"] is None:
+            raise MemoryError("operation_unavailable", "原操作已执行，但结果已清除或失效；请查询原回执，不会重新执行。")
+        return self._operation_result(receipt["result"], receipt)
+
+    @staticmethod
+    def _operation_result(result, receipt):
+        return {**result, "operation_id":receipt["operation_id"],
+                "receipt":{k:receipt[k] for k in ("status", "current_state", "kind", "request_hash")}}
+
+    def _record_operation(self, owner, operation_id, kind, request, event_ids, result):
+        self.db.execute("INSERT INTO operation_receipts VALUES(?,?,?,?,?,?,?,?)", (
+            owner, operation_id, kind, fingerprint(request), self.authorize(owner)["epoch"],
+            dumps(event_ids), dumps(result), now()))
+        return self._operation_result(result, self.operation(owner, operation_id))
+
+    def correct_topics(self, owner: str, event_id: str, expected_revision: int, names: list[str], operation_id: str | None = None) -> dict:
+        explicit_operation = operation_id is not None
         if not isinstance(names, list) or len(names) > 20 or not all(isinstance(name, str) for name in names):
             raise MemoryError("invalid_topic", "一次最多设置 20 个主题名称。")
         if type(expected_revision) is not int or expected_revision < 1:
             raise MemoryError("invalid_revision", "关联修订须为正整数。")
+        operation_id = self.operation_id(operation_id)
+        request = {"event_id":event_id,"revision":expected_revision,"names":names}
         with self.transaction():
+            self.authorize(owner)
+            replay = self._operation_replay(owner, operation_id, "correct_topics", request)
+            if replay is not None:
+                return replay
             event = self.event(owner, event_id)
             if event["association_revision"] != expected_revision:
                 raise MemoryError("revision_conflict", "主题关联已变化，请重新读取后再纠正。")
@@ -451,20 +637,32 @@ class Store:
             self.db.execute("UPDATE events SET association_revision=association_revision+1 WHERE id=?", (event_id,))
             self.db.execute("INSERT INTO corrections VALUES(?,?,?,?,?,?)", (
                 uuid.uuid4().hex, event_id, expected_revision+1, dumps(before), dumps(names), now()))
-        return self.event(owner, event_id)
+            dependents = [r[0] for r in self.db.execute("SELECT DISTINCT job_id FROM input_dependencies WHERE event_id=? AND job_id<>parent_job_id", (event_id,))]
+            self._invalidate_jobs(self._dependent_jobs(dependents))
+            event = self.event(owner, event_id)
+            result = self._record_operation(owner, operation_id, "correct_topics", request, [event_id], event)
+            return result if explicit_operation else event
 
-    def select(self, owner: str, event_ids: list[str], purpose: str) -> dict:
+    def select(self, owner: str, event_ids: list[str], purpose: str, operation_id: str | None = None) -> dict:
+        explicit_operation = operation_id is not None
         if not isinstance(event_ids, list) or not event_ids or len(event_ids) > 100 or not all(isinstance(v, str) for v in event_ids) or not isinstance(purpose, str) or not purpose.strip():
             raise MemoryError("invalid_selection", "请选择 1—100 个事件并说明用途。")
+        operation_id = self.operation_id(operation_id)
+        request = {"event_ids":event_ids,"purpose":purpose}
         with self.transaction():
             account = self.authorize(owner)
+            replay = self._operation_replay(owner, operation_id, "select", request)
+            if replay is not None:
+                return replay
             events = [self.event(owner, event_id) for event_id in dict.fromkeys(event_ids)]
             selection = {"id": uuid.uuid4().hex, "purpose": purpose, "events": [
                 {"id": e["id"], "version": e["version"], "source_id": e["source_id"],
                  "association_revision": e["association_revision"], "evidence_refs": e["refs"]}
                 for e in events]}
             self.db.execute("INSERT INTO selections VALUES(?,?,?,?,?)", (selection["id"], owner, account["epoch"], dumps(selection), now()))
-        return selection
+            # 无编号的内部调用仍返回兼容结构；显式编号的调用可查询和重放回执。
+            result = self._record_operation(owner, operation_id, "select", request, [e["id"] for e in events], selection)
+            return result if explicit_operation else selection
 
     def selection(self, owner: str, selection_id: str) -> dict:
         row = self.db.execute("SELECT * FROM selections WHERE id=? AND owner=?", (selection_id, owner)).fetchone()
@@ -478,21 +676,17 @@ class Store:
                 raise MemoryError("selection_conflict", "所选版本或关联修订已变化，请重新选择。")
         return value
 
-    def clear_recording(self, owner: str, recording: str):
+    def clear_recording(self, owner: str, recording: str, ledger=None):
         with self.transaction():
             self.authorize(owner)
             self.db.execute("INSERT OR IGNORE INTO tombstones VALUES(?,?)", (owner, recording))
             ids = [row[0] for row in self.db.execute("SELECT id FROM sources WHERE owner=? AND recording=?", (owner, recording))]
+            roots = [r[0] for r in self.db.execute("SELECT id FROM jobs WHERE owner=? AND source_id IN (SELECT id FROM sources WHERE owner=? AND recording=?)", (owner, owner, recording))]
+            # 旧作业没有实际输入依赖记录，不能根据最终关系边证明独立，保守撤下并清除其调用副本。
+            if ids:
+                roots.extend(r[0] for r in self.db.execute("SELECT id FROM jobs WHERE owner=? AND id NOT IN (SELECT job_id FROM input_dependencies WHERE batch_index=-1)", (owner,)))
+            self._invalidate_jobs(self._dependent_jobs(roots), clear=True)
             for source_id in ids:
-                jobs = [r[0] for r in self.db.execute("SELECT id FROM jobs WHERE source_id=?", (source_id,))]
-                event_ids = [r[0] for r in self.db.execute("SELECT id FROM event_details WHERE source_id=?", (source_id,))]
-                for event_id in event_ids:
-                    self.db.execute("DELETE FROM associations WHERE event_id=?", (event_id,))
-                    self.db.execute("DELETE FROM corrections WHERE event_id=?", (event_id,))
-                self.db.execute("DELETE FROM events WHERE id IN (SELECT id FROM event_details WHERE source_id=?)", (source_id,))
-                for job_id in jobs:
-                    self.db.execute("DELETE FROM unclassified WHERE job_id=?", (job_id,))
-                    self.db.execute("DELETE FROM batch_results WHERE job_id=?", (job_id,))
                 self.db.execute("UPDATE jobs SET status='cancelled',error='cleared' WHERE source_id=?", (source_id,))
                 self.db.execute("DELETE FROM segments WHERE source_id=?", (source_id,))
                 self.db.execute("UPDATE sources SET state='cleared',raw='',metadata='{}' WHERE id=?", (source_id,))
@@ -503,3 +697,5 @@ class Store:
                 if any(member["source_id"] in affected_sources for member in members):
                     self.db.execute("DELETE FROM selections WHERE id=? AND owner=?", (selection["id"], owner))
             self.db.execute("DELETE FROM topics WHERE owner=? AND id NOT IN (SELECT topic_id FROM associations)", (owner,))
+        if ledger is not None:
+            self.flush_purges(ledger)

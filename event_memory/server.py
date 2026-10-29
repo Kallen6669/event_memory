@@ -14,7 +14,7 @@ from .model import Ledger
 from .openai_model import ChatGPTModel
 from .pipeline import Pipeline
 from .prompt import PROMPT_VERSION
-from .store import Store, dumps
+from .store import Store, dumps, fingerprint
 
 ASSETS = Path(__file__).resolve().parent / "web"
 
@@ -91,9 +91,11 @@ def create_server(db_path: Path, owner: str = "local", port: int = 8765,
                 url = urlsplit(self.path)
                 if url.path == "/":
                     html = (ASSETS / "index.html").read_text(encoding="utf-8").replace("__SESSION_TOKEN__", session_token)
+                    html = html.replace("__STORE_ID__", fingerprint([str(Path(db_path).resolve()),owner])[:24])
                     self.send_body(html.encode("utf-8"), content_type="text/html; charset=utf-8")
                     return
                 static = {"/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                          "/operations.js": ("operations.js", "text/javascript; charset=utf-8"),
                           "/style.css": ("style.css", "text/css; charset=utf-8")}
                 if url.path in static:
                     file, mime = static[url.path]
@@ -123,9 +125,12 @@ def create_server(db_path: Path, owner: str = "local", port: int = 8765,
                         for row in rows]})
                 elif len(parts) == 3 and parts[:2] == ["api", "selections"]:
                     self.send_body(export_selection(store, owner, parts[2]))
+                elif len(parts) == 3 and parts[:2] == ["api", "operations"]:
+                    self.send_body(store.operation(owner, parts[2]))
                 elif url.path == "/api/budget":
                     ledger = Ledger(ledger_path, configured_budget())
                     try:
+                        ledger.bind_store(store)
                         self.send_body(ledger.summary())
                     finally:
                         ledger.close()
@@ -171,9 +176,13 @@ def create_server(db_path: Path, owner: str = "local", port: int = 8765,
                         self.schedule(job["id"])
                     self.send_body({"job_id": job["id"], "status": job["status"], "effective_model": settings["model"], "configured_model": config.model}, 202)
                 elif len(parts) == 4 and parts[:2] == ["api", "events"] and parts[3] == "topics":
-                    self.send_body(store.correct_topics(owner, parts[2], int(value["revision"]), value["names"]))
+                    if not isinstance(value.get("operation_id"),str):
+                        raise MemoryError("invalid_operation", "纠正请求必须提供稳定的operation_id用于结果核对。")
+                    self.send_body(store.correct_topics(owner, parts[2], value["revision"], value["names"], value["operation_id"]))
                 elif parts == ["api", "selections"]:
-                    self.send_body(store.select(owner, value["event_ids"], value["purpose"]), 201)
+                    if not isinstance(value.get("operation_id"),str):
+                        raise MemoryError("invalid_operation", "固定选择请求必须提供稳定的operation_id用于结果核对。")
+                    self.send_body(store.select(owner, value["event_ids"], value["purpose"], value["operation_id"]), 201)
                 elif len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
                     store.job_state(owner, parts[2], "cancelled")
                     self.send_body({"status": "cancelled"})
@@ -196,8 +205,8 @@ def create_server(db_path: Path, owner: str = "local", port: int = 8765,
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-def serve(db_path: Path, owner: str, port: int):
-    server = create_server(db_path, owner, port)
+def serve(db_path: Path, owner: str, port: int, ledger_path: Path = DEFAULT_LEDGER):
+    server = create_server(db_path, owner, port, ledger_path)
     print(f"本地查询已启动：http://127.0.0.1:{server.server_port}；按 Ctrl+C 停止。", flush=True)
     try:
         server.serve_forever()
