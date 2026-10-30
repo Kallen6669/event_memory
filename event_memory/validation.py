@@ -23,10 +23,12 @@ def quote_locations(source: str, quote: str):
         start = source.find(quote, start + 1)
 
 
-def check_claim_condition(kind: str, quote: str, source: str):
+def check_claim_condition(kind: str, quote: str, source: str, quote_span=None):
     """保护可明确定位的条件限定，不声称用词面规则证明全部语义。"""
     quote = quote.replace("\n", "")
     positions = list(quote_locations(source, quote))
+    if quote_span is not None:
+        positions = [(start,end) for start,end in positions if start >= quote_span[0] and end <= quote_span[1]]
     if kind == "condition":
         # 条件也可用“……的话”“考到这个分数，就……”表达。
         # 检查引文有没有截掉所在条件分句，而非强制模型使用固定六个词。
@@ -122,6 +124,29 @@ def text_field(value, name: str, maximum: int) -> str:
     return value
 
 
+def surrounding_claim_context(allowed, refs):
+    """按相邻来源编号回读同一说话人的未结束语句；上下文不能替代实际引用位置。"""
+    by_number = {int(ref[1:]): row for ref,row in allowed.items()}
+    first, last = int(refs[0][1:]), int(refs[-1][1:])
+    left, right = first, last
+    def ended(text):
+        return bool(re.search(r'[。！？!?；;][\s”’\"\')」』]*$', text))
+    while left-1 in by_number:
+        previous, current = by_number[left-1], by_number[left]
+        if previous.get('speakers') != current.get('speakers') or ended(previous['text']):
+            break
+        left -= 1
+    while right+1 in by_number:
+        current, following = by_number[right], by_number[right+1]
+        if current.get('speakers') != following.get('speakers') or ended(current['text']):
+            break
+        right += 1
+    prefix = ''.join(by_number[i]['text'] for i in range(left,first))
+    selected = ''.join(allowed[ref]['text'] for ref in refs)
+    suffix = ''.join(by_number[i]['text'] for i in range(last+1,right+1))
+    return prefix+selected+suffix, (len(prefix),len(prefix)+len(selected))
+
+
 def validate_output(value, batch: dict, candidates: dict) -> dict:
     if isinstance(value, str):
         try:
@@ -182,7 +207,8 @@ def validate_output(value, batch: dict, candidates: dict) -> dict:
             if quote not in joined and quote not in joined_plain:
                 raise InvalidOutput("主张引文与原文不匹配，不能替换引文后保留原主张标签；请逐字修正。")
             try:
-                check_claim_condition(claim["kind"], quote, joined_plain)
+                context, quote_span = surrounding_claim_context(allowed, claim_refs)
+                check_claim_condition(claim["kind"], quote, context, quote_span)
             except InvalidOutput as exc:
                 raise InvalidOutput(f"主张 {claim['kind']}，引用 {','.join(claim_refs)}，引文“{quote[:180]}”：{exc}") from exc
             if claim["kind"] == "condition":

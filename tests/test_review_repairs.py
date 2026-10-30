@@ -11,6 +11,32 @@ from tests.test_core import FixtureModel, SAMPLE, output_for
 
 
 class ReviewRepairTests(unittest.TestCase):
+    def test_single_fragment_cannot_hide_previous_negation_or_condition(self):
+        for words,kind in [(["我们","没有","决定采用net2。"],"decision"),
+                           (["如果明天下雨，","就取消面试。"],"cancellation"),
+                           (["决定采用net2，","但没有","决定采用net2。"],"decision")]:
+            raw="\n".join(f"[09:00:0{i}.000 – 09:00:0{i+1}.000] SPK_1: {word}" for i,word in enumerate(words))
+            batch=build_batches(parse_transcript(raw).segments)[0]
+            last=batch["primary"][-1]
+            value=output_for(batch)
+            value["events"][0].update(evidence_refs=[last["ref"]],claims=[{"kind":kind,"quote":last["text"],"refs":[last["ref"]]}])
+            with self.subTest(words=words),self.assertRaises(InvalidOutput):
+                validate_output(value,batch,{"events":[],"topics":[]})
+
+    def test_completed_sentence_or_other_speaker_does_not_inherit_negation(self):
+        for first,speaker in [("我们没有决定。","SPK_1"),("我们没有","SPK_2")]:
+            raw=f"[09:00:00.000 – 09:00:01.000] SPK_1: {first}\n[09:00:01.000 – 09:00:02.000] {speaker}: 决定采用net2。"
+            batch=build_batches(parse_transcript(raw).segments)[0];value=output_for(batch)
+            value["events"][0].update(evidence_refs=["U000002"],claims=[{"kind":"decision","quote":"决定采用net2。","refs":["U000002"]}])
+            self.assertTrue(validate_output(value,batch,{"events":[],"topics":[]})["events"])
+
+    def test_preceding_context_fragment_is_checked_without_rewriting_quote(self):
+        parsed=parse_transcript("[09:00:00 – 09:00:01] SPK_1: 我们没有\n[09:00:01 – 09:00:02] SPK_1: 决定采用net2。")
+        batch={"context":[parsed.segments[0].payload()],"primary":[parsed.segments[1].payload()]}
+        value=output_for(batch)
+        value["events"][0]["claims"][0]["kind"]="decision"
+        with self.assertRaises(InvalidOutput):validate_output(value,batch,{"events":[],"topics":[]})
+
     def test_claim_cannot_join_across_omitted_negation_but_event_can_have_gaps(self):
         raw = "\n".join(f"[09:00:0{i}.000 – 09:00:0{i+1}.000] SPK_1: {text}"
                         for i,text in enumerate(["我们", "没有", "决定采用net2。"]))
