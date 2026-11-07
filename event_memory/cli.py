@@ -56,7 +56,7 @@ def export_selection(store: Store, owner: str, selection_id: str) -> dict:
 
 def parser() -> argparse.ArgumentParser:
     p = ChineseParser(description="离线转录文档的事件、主题与原文查询")
-    p.add_argument("--db", default=str(DEFAULT_DB), help="本地事实数据库路径")
+    p.add_argument("--db", help="本地事实数据库路径；样例评测默认使用独立评测库")
     p.add_argument("--ledger", default=str(DEFAULT_LEDGER), help="与事实库配套的调用账本；独立测试库请同时指定")
     p.add_argument("--owner", default="local", help="可信本地账号命名空间，不等同于远程身份认证")
     commands = p.add_subparsers(dest="command", required=True, title="操作")
@@ -133,6 +133,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    explicit_db = args.db
+    args.db = args.db if args.db is not None else str(DEFAULT_DB)
     store = None
     ledger = None
     try:
@@ -167,11 +169,12 @@ def main(argv=None) -> int:
             serve(Path(args.db), args.owner, args.port, Path(args.ledger))
             return 0
         if args.command == "evaluate-cases":
+            cases_db = Path(explicit_db) if explicit_db is not None else ROOT / ".runtime" / "semantic-evaluation.sqlite"
             if args.report_only:
                 import sqlite3
                 from .evaluation import report_cases
                 store = Store(":memory:")
-                source_db = ROOT / ".runtime" / "semantic-evaluation.sqlite"
+                source_db = cases_db
                 if source_db.exists():
                     source = sqlite3.connect(source_db.resolve().as_uri()+"?mode=ro", uri=True)
                     try:
@@ -180,7 +183,8 @@ def main(argv=None) -> int:
                     finally:
                         source.close()
                 model_name = args.report_model or env_values().get("OPENAI_MODEL", "gpt-6.1-sol")
-                result = report_cases(store, model_name, Path(args.cases), prompt_version=args.report_prompt_version)
+                result = report_cases(store, model_name, Path(args.cases), ledger_path=Path(args.ledger),
+                                      prompt_version=args.report_prompt_version)
                 result["mode"] = "report_only"
                 result["model_calls_started"] = 0
                 target = Path(args.out)
@@ -195,7 +199,7 @@ def main(argv=None) -> int:
             if args.report_model or args.report_prompt_version:
                 raise MemoryError("invalid_mode", "报告的模型/策略选择只适用于只读报告；真实调用使用当前已授权模型及策略。")
             from .evaluation import run_cases
-            store = Store(ROOT / ".runtime" / "semantic-evaluation.sqlite")
+            store = Store(cases_db)
             ledger = Ledger(args.ledger, configured_budget())
             result = run_cases(store, create_model(ledger), Path(args.cases))
             target = Path(args.out)
@@ -274,7 +278,7 @@ def main(argv=None) -> int:
             emit({"status": "reconciled", "call_id": args.call_id})
         elif args.command == "evaluate":
             from .evaluation import evaluate
-            result = evaluate(store, args.owner, args.source_id)
+            result = evaluate(store, args.owner, args.source_id, ledger_path=Path(args.ledger))
             target = Path(args.out)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

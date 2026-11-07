@@ -79,6 +79,7 @@ class RequirementRegressionTests(unittest.TestCase):
         target = self.store.correct_topics("review", target["id"], 1, ["Z长期课题"])
         candidates = self.store.candidates("review", "论文甲研究方法", "新作业")
         self.assertEqual(len(self.store.topics("review")), 81)
+        self.assertEqual(candidates["scope"]["topic_total"], 81)
         self.assertLessEqual(len(candidates["topics"]), 80)
         self.assertIn(target["topics"][0]["id"], {t["id"] for t in candidates["topics"]})
         self.assertEqual(self.store.candidates("other", "论文甲研究方法", "other")["topics"], [])

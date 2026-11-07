@@ -552,6 +552,7 @@ class Store:
             related_score = related_topic_scores.get(topic["id"], 0)
             return (-(name_score + related_score), -name_score, -related_score, topic["name"], topic["id"])
         topics.sort(key=topic_rank)
+        topic_total = len(topics)
         topics = topics[:80]
         for topic in topics:
             topic["input_events"] = [dict(r) for r in self.db.execute(
@@ -559,7 +560,7 @@ class Store:
                 (topic["id"], owner, job_id))]
         return {"events": chosen, "topics": topics[:80],
                 "scope": {"owner_filtered": True, "event_limit": limit,
-                          "topic_limit": 80, "topic_total": len(topics), "topic_method": "name_and_recalled_events",
+                          "topic_limit": 80, "topic_total": topic_total, "topic_method": "name_and_recalled_events",
                           "method": "local_character_bigram", "relation_is_suggestion": True}}
 
     @staticmethod

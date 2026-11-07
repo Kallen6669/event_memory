@@ -12,8 +12,36 @@ CONDITION_PATTERN = re.compile("|".join(CONDITIONAL) + r"|的话|只要|只有")
 CLAUSE_END = re.compile(r"[。！？!?；;]")
 DEFINITE_ACTION = re.compile(r"(?:已经|已|决定|确定|确认)[^。！？!?，,；;]{0,10}?(取消|完成|改用|采用|改为|付款|支付|送达|续费|提交|发送)")
 QUALIFIED = re.compile(r"如果|要是|除非|前提|倘若|假如|的话|只要|只有|条件|是否|考虑|可能|不确定|尚未|还未|未决定|没有决定|未确认|不能确认|计划|提议")
-NEGATION_PREFIX = r"(?:没有|尚未|还没|并未|并非|未必|未|没|不要|不能|无法|不|别)(?:再|曾经|真正|实际|完全|已经|决定|确认|能|会|\s){0,3}"
+NEGATION_PREFIX = r"(?:没有|尚未|还没|并未|并非|未必|未|没|不要|不能|无法|不|别)(?:再|曾经|真正|实际|完全|正式|作出|做出|已经|决定|确认|能|会|\s){0,4}"
 NON_ASSERTIVE = re.compile(r"(?:不(?:代表|表示|意味着|等于|说明|证明|表明)|不是说|不能(?:确认|证明|认定|说明|表明)|无法(?:确认|证明|认定)|没有(?:证据|依据)|尚无(?:证据|依据)|未(?:确认|证实))[^。！？!?；;]{0,60}$")
+ACTION = r"(?:决定|确定|确认|取消|撤回|作废|完成|办好|发出|发送|付款|支付|收到|提交|续费|点好|采用|改用|改为|送达)"
+NEGATED_ACTION = re.compile(NEGATION_PREFIX + r"(" + ACTION + r"[^。！？!?，,；;\n]*)")
+
+
+def assertion_is_qualified(text: str, start: int) -> bool:
+    """只在当前分句内判断限定，转折后的独立肯定不能借用前面的否定。"""
+    prefix = re.split(r"[。！？!?；;，,]|但是|不过|然而|而是|但", text[:start])[-1]
+    return bool(re.search(NEGATION_PREFIX + r"$", prefix)
+                or NON_ASSERTIVE.search(prefix)
+                or re.search(r"是否|可能|考虑|计划|提议|如果|只要|只有", prefix))
+
+
+def check_negated_summary(item: dict, contexts: list[str]):
+    """拦截与原文相同动作、对象的明显反向概括，不把词面检查当作语义证明。"""
+    for source in contexts:
+        for denied in NEGATED_ACTION.finditer(source):
+            predicate = denied.group(1).strip().rstrip("了")
+            if not predicate:
+                continue
+            pattern = re.compile(re.escape(predicate))
+            # 同一事件可同时记录前后改口；有独立肯定原话时保留给语义复核。
+            if any(not assertion_is_qualified(other, match.start())
+                   for other in contexts for match in pattern.finditer(other)):
+                continue
+            for description in (item["title"], item["summary"]):
+                for match in pattern.finditer(description):
+                    if not assertion_is_qualified(description, match.start()):
+                        raise InvalidOutput("标题或概括把原文明确否定的行动写成肯定，请保留否定范围或未知。")
 
 
 def quote_locations(source: str, quote: str):
@@ -29,6 +57,11 @@ def check_claim_condition(kind: str, quote: str, source: str, quote_span=None):
     positions = list(quote_locations(source, quote))
     if quote_span is not None:
         positions = [(start,end) for start,end in positions if start >= quote_span[0] and end <= quote_span[1]]
+    # 所有标签都必须保留引文前的否定，statement、denial 等也不能成为绕过入口。
+    if positions and all(re.search(NEGATION_PREFIX + r"$", re.split(r"[。！？!?；;，,]", source[:start])[-1])
+                         or NON_ASSERTIVE.search(re.split(r"[。！？!?；;，,]", source[:start])[-1])
+                         for start, _ in positions):
+        raise InvalidOutput("主张引文截掉了原文的否定限定，请引用包含限定的原话。")
     if kind == "condition":
         # 条件也可用“……的话”“考到这个分数，就……”表达。
         # 检查引文有没有截掉所在条件分句，而非强制模型使用固定六个词。
@@ -147,7 +180,7 @@ def surrounding_claim_context(allowed, refs):
     return prefix+selected+suffix, (len(prefix),len(prefix)+len(selected))
 
 
-def validate_output(value, batch: dict, candidates: dict) -> dict:
+def validate_output(value, batch: dict, candidates: dict, *, source_segments=None) -> dict:
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -161,6 +194,8 @@ def validate_output(value, batch: dict, candidates: dict) -> dict:
     if primary and not value["events"] and not value["unclassified"]:
         raise InvalidOutput("非空输入不能用完全空的解释结果伪装成功。")
     allowed = {row["ref"]: row for row in batch["context"] + batch["primary"]}
+    # 固定原文只用于校验限定；不会扩大模型获准引用的范围，也不改变冻结请求。
+    reading = ({row["ref"]: row for row in source_segments} if source_segments is not None else allowed)
     offered = {row["id"]: row for row in candidates["events"]}
     topics = {row["id"] for row in candidates["topics"]}
     covered = set()
@@ -207,7 +242,7 @@ def validate_output(value, batch: dict, candidates: dict) -> dict:
             if quote not in joined and quote not in joined_plain:
                 raise InvalidOutput("主张引文与原文不匹配，不能替换引文后保留原主张标签；请逐字修正。")
             try:
-                context, quote_span = surrounding_claim_context(allowed, claim_refs)
+                context, quote_span = surrounding_claim_context(reading, claim_refs)
                 check_claim_condition(claim["kind"], quote, context, quote_span)
             except InvalidOutput as exc:
                 raise InvalidOutput(f"主张 {claim['kind']}，引用 {','.join(claim_refs)}，引文“{quote[:180]}”：{exc}") from exc
@@ -223,6 +258,7 @@ def validate_output(value, batch: dict, candidates: dict) -> dict:
             if any(word in allowed[ref]["text"] for word in CONDITIONAL) and ref not in condition_refs:
                 raise InvalidOutput("引用含明确条件，但没有保留对应条件主张。")
         check_conditional_summary(item, "".join(allowed[ref]["text"] for ref in sorted(refs)))
+        check_negated_summary(item, [surrounding_claim_context(reading, [ref])[0] for ref in refs])
         suggestions = item.get("topics")
         if not isinstance(suggestions, list) or len(suggestions) > 12:
             raise InvalidOutput("主题建议须为最多 12 项的数组。")

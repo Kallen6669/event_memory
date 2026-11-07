@@ -13,6 +13,7 @@ from event_memory.transcript import parse_transcript,build_batches
 from event_memory.validation import validate_output
 from event_memory.cli import main
 from event_memory.ledger import Ledger
+from event_memory.errors import MemoryError,InvalidOutput
 
 def event(ref,text,kind,quote):
     return {'title':'方案讨论','summary':text,'evidence_refs':[ref],
@@ -26,7 +27,7 @@ for name,item in [('denial_claim_positive_summary',event('U000001','我们已经
     try:
         validate_output({'events':[item],'unclassified':[]},batch,{'events':[],'topics':[]})
         accepted=True
-    except Exception as exc:accepted=False
+    except InvalidOutput:accepted=False
     result['findings'][name]={'incorrect_output_accepted':accepted}
 
 class Model:
@@ -41,8 +42,12 @@ class Model:
 store=Store(':memory:')
 try:
     source=store.import_source('review',raw,'contradiction')
-    output=Pipeline(store,Model('summary')).process('review',source['id'],'contradiction')
-    result['findings']['published_summary_contradicts_denial']={'job_status':output['status'],'published_summary':store.list_events('review')[0]['summary']}
+    error=None
+    try:output=Pipeline(store,Model('summary')).process('review',source['id'],'contradiction')
+    except MemoryError as exc:error=exc.code
+    events=store.list_events('review')
+    result['findings']['published_summary_contradicts_denial']={'job_status':store.db.execute('SELECT status FROM jobs').fetchone()[0],
+        'error':error,'incorrect_output_published':bool(events),'published_summary':events[0]['summary'] if events else None}
 finally:store.close()
 
 raw='[09:00:00 – 09:00:01] S: '+('背景'*2940)+'，我们没有\n[09:00:01 – 09:00:02] S: 决定采用net2。\n'
@@ -51,9 +56,11 @@ assert len(batches)==2 and not batches[1]['context']
 store=Store(':memory:')
 try:
     source=store.import_source('review',raw,'boundary')
-    output=Pipeline(store,Model('boundary')).process('review',source['id'],'boundary')
+    error=None
+    try:output=Pipeline(store,Model('boundary')).process('review',source['id'],'boundary')
+    except MemoryError as exc:error=exc.code
     result['findings']['default_batch_boundary_loses_negation']={'batch_parameters':[6000,900],'batches':len(batches),
-       'second_context_count':len(batches[1]['context']),'job_status':output['status'],
+       'second_context_count':len(batches[1]['context']),'job_status':store.db.execute('SELECT status FROM jobs').fetchone()[0],'error':error,
        'published_decision':any(c['kind']=='decision' for e in store.list_events('review') for c in e['claims'])}
 finally:store.close()
 
@@ -78,6 +85,16 @@ assert code==0
 data=json.loads(report.read_text(encoding='utf-8'))
 result['findings']['cli_ignores_explicit_evaluation_ledger']={'requested_ledger':str(calls),'expected_calls':1,'expected_input_tokens':123,'actual_model_runs':data['model_runs']}
 result['expected_issues_reproduced']=all([result['findings']['denial_claim_positive_summary']['incorrect_output_accepted'],result['findings']['statement_omits_negation']['incorrect_output_accepted'],result['findings']['default_batch_boundary_loses_negation']['published_decision'],result['findings']['cli_ignores_explicit_evaluation_ledger']['actual_model_runs']['available'] is False])
-result['product_acceptance']='not_passed_known_issues'
+result['all_registered_issues_fixed']=all([
+    not result['findings']['denial_claim_positive_summary']['incorrect_output_accepted'],
+    not result['findings']['statement_omits_negation']['incorrect_output_accepted'],
+    result['findings']['published_summary_contradicts_denial']['error']=='invalid_output',
+    not result['findings']['published_summary_contradicts_denial']['incorrect_output_published'],
+    result['findings']['default_batch_boundary_loses_negation']['error']=='invalid_output',
+    not result['findings']['default_batch_boundary_loses_negation']['published_decision'],
+    data['model_runs'].get('calls')==1,
+    (data['model_runs'].get('provider_usage') or {}).get('input_tokens')==123])
+result['product_acceptance']='independent_semantic_review_pending'
 (BASE/'evidence.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
 print(json.dumps(result,ensure_ascii=False,indent=2))
+raise SystemExit(0 if result['all_registered_issues_fixed'] else 1)

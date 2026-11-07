@@ -54,6 +54,7 @@ class Pipeline:
             raise MemoryError("account_changed", "作业绑定的模型账号已变化，不向新账号续发原材料。")
         source = self.store.source(owner, job["source_id"])
         transcript = parse_transcript(source["raw"])
+        validation_segments = [segment.payload() for segment in transcript.segments]
         if settings.get("kind") == "salient_refinement":
             by_ref = {s.ref: s.payload() for s in transcript.segments}
             batches = [{"primary": [by_ref[r] for r in settings["primary_refs"]],
@@ -112,7 +113,8 @@ class Pipeline:
                         response = self.model.generate(call_id, job_id, messages)
                     self.store.check_job(owner, job_id)
                     try:
-                        validated = validate_output(response["content"], batch, candidates)
+                        validated = validate_output(response["content"], batch, candidates,
+                                                    source_segments=validation_segments)
                         break
                     except InvalidOutput as exc:
                         if attempt == 3:

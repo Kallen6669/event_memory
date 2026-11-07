@@ -39,7 +39,9 @@ def run_cases(store: Store, model, cases_path: Path) -> dict:
         except MemoryError as exc:
             stopped = {"case": case["id"], "error": exc.code, "message": str(exc)}
             break
-    report = report_cases(store, model_name, cases_path)
+    ledger = getattr(model, "ledger", None)
+    report = report_cases(store, model_name, cases_path,
+                          ledger_path=ledger.path if ledger is not None else DEFAULT_LEDGER)
     report["execution_stopped"] = stopped
     return report
 
